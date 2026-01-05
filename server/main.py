@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict, Tuple
 from math import sqrt
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 import folium
@@ -26,7 +26,7 @@ class FingerprintEntry(SQLModel, table=True):
     mac: str
     rssi: int
 
-# Create tables
+# Create tables if not exist
 SQLModel.metadata.create_all(engine)
 
 # -----------------------------
@@ -35,7 +35,7 @@ SQLModel.metadata.create_all(engine)
 app = FastAPI(title="Wi-Fi Fingerprinting Server with Map")
 
 # -----------------------------
-# Pydantic models for API
+# Pydantic models
 # -----------------------------
 class WifiReading(BaseModel):
     mac: str
@@ -45,6 +45,11 @@ class WifiScan(BaseModel):
     device_id: str
     scan: List[WifiReading]
 
+class CalibrationRequest(BaseModel):
+    device_id: str
+    lat: float
+    lon: float
+
 # -----------------------------
 # Dependency: session generator
 # -----------------------------
@@ -53,95 +58,103 @@ def get_session():
         yield session
 
 # -----------------------------
+# Pending calibration storage
+# -----------------------------
+# Store device_id -> coordinates until next scan arrives
+pending_calibrations: Dict[str, Tuple[float, float]] = {}
+
+# -----------------------------
 # Calibration endpoint
 # -----------------------------
 @app.post("/scan/calibrate")
-def calibrate(scan: WifiScan, lat: float, lon: float, session: Session = Depends(get_session)):
-    fingerprint = Fingerprint(lat=lat, lon=lon)
-    session.add(fingerprint)
-    session.commit()
-    session.refresh(fingerprint)
-
-    for ap in scan.scan:
-        entry = FingerprintEntry(
-            fingerprint_id=fingerprint.id,
-            mac=ap.mac,
-            rssi=ap.rssi
-        )
-        session.add(entry)
-    session.commit()
-
-    total = session.exec(select(Fingerprint)).count()
+def calibrate(req: CalibrationRequest):
+    """
+    Receive device_id + coordinates and store them in memory.
+    The next /scan/locate payload from this device will be saved in the database.
+    """
+    pending_calibrations[req.device_id] = (req.lat, req.lon)
     return {
-        "status": "stored",
-        "fingerprint_id": fingerprint.id,
-        "total_fingerprints": total
+        "status": "pending",
+        "device_id": req.device_id,
+        "lat": req.lat,
+        "lon": req.lon,
+        "message": "Next Wi-Fi scan from this device will be linked to these coordinates"
     }
 
 # -----------------------------
-# Localization endpoint
+# Locate endpoint
 # -----------------------------
 @app.post("/scan/locate")
 def locate(scan: WifiScan, session: Session = Depends(get_session)):
     """
-    Compare live scan against stored fingerprints and estimate position
-    using weighted average of RSSI similarities.
+    Compare live scan against stored fingerprints and estimate position.
+    If calibration pending for this device, save the fingerprint first.
     """
     scan_fp = {ap.mac: ap.rssi for ap in scan.scan}
 
-    # Load all fingerprints
+    # ----------- Store fingerprint if calibration is pending -----------
+    if scan.device_id in pending_calibrations:
+        lat, lon = pending_calibrations.pop(scan.device_id)
+        fingerprint = Fingerprint(lat=lat, lon=lon)
+        session.add(fingerprint)
+        session.commit()
+        session.refresh(fingerprint)
+
+        for ap in scan.scan:
+            entry = FingerprintEntry(
+                fingerprint_id=fingerprint.id,
+                mac=ap.mac,
+                rssi=ap.rssi
+            )
+            session.add(entry)
+        session.commit()
+        print(f"[INFO] Calibration saved for device {scan.device_id} at ({lat}, {lon})")
+
+    # ----------- Estimate position -----------
     fingerprints = session.exec(select(Fingerprint)).all()
     if not fingerprints:
-        raise HTTPException(status_code=404, detail="No fingerprints in database")
+        return {
+            "status": "pending",
+            "message": "No fingerprints in database. Calibrate first."
+        }
 
-    best_score = float("inf")
-    best_position = None
-
-    weights = []  # To store weights for each fingerprint
     weighted_lat = 0.0
     weighted_lon = 0.0
     total_weight = 0.0
 
     for fp in fingerprints:
-        # Get the fingerprint entries for this position
         entries = session.exec(
             select(FingerprintEntry).where(FingerprintEntry.fingerprint_id == fp.id)
         ).all()
-
         db_fp = {e.mac: e.rssi for e in entries}
 
-        # Find common MACs between scan and stored fingerprint
+        # Only consider common MACs
         common_macs = set(scan_fp.keys()) & set(db_fp.keys())
         if not common_macs:
             continue
 
-        # Euclidean distance in RSSI space
-        distance = sqrt(
-            sum((scan_fp[mac] - db_fp[mac]) ** 2 for mac in common_macs)
-        )
+        # Euclidean distance
+        distance = sqrt(sum((scan_fp[mac] - db_fp[mac]) ** 2 for mac in common_macs))
+        weight = 1 / (distance + 0.01)  # avoid division by 0
 
-        # Compute the weight as the inverse of the distance
-        weight = 1 / (distance + 0.01)  # Adding a small value to avoid division by 0
-
-        # Update weighted position
         weighted_lat += weight * fp.lat
         weighted_lon += weight * fp.lon
         total_weight += weight
 
     if total_weight == 0:
-        raise HTTPException(status_code=404, detail="No matching fingerprints found")
+        return {
+            "status": "pending",
+            "message": "No matching fingerprints found. Send Wi-Fi scan after calibration."
+        }
 
-    # Compute the final weighted average position
     estimated_lat = weighted_lat / total_weight
     estimated_lon = weighted_lon / total_weight
 
     return {
         "status": "ok",
-        "estimated_position": {"lat": estimated_lat, "lon": estimated_lon},
-        "score": best_score
+        "estimated_position": {"lat": estimated_lat, "lon": estimated_lon}
     }
 
-    
 # -----------------------------
 # Map endpoint
 # -----------------------------
@@ -155,7 +168,7 @@ def show_map(device_id: str, session: Session = Depends(get_session)):
         center_lat = latest_fp.lat
         center_lon = latest_fp.lon
     else:
-        center_lat = 48.8566  # default center (Paris)
+        center_lat = 48.8566
         center_lon = 2.3522
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=16)
