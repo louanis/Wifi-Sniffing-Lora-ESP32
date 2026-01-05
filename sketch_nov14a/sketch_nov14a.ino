@@ -8,8 +8,8 @@
 
 // ================= API CONFIG =================
 #define DEVICE_ID "esp32-001"
-#define LOCATE_URL "http://87.88.146.8:8067/scan/locate"
-#define CALIBRATE_URL "http://87.88.146.8:8067/scan/calibrate"
+#define LOCATE_URL "http://vps-98cd652a.vps.ovh.net:8067/scan/locate"
+#define CALIBRATE_URL "http://vps-98cd652a.vps.ovh.net:8067/scan/calibrate"
 
 // ================= LORA CONFIG =================
 #define LORA_RX 16
@@ -23,8 +23,9 @@
 HardwareSerial LoRa(2);
 
 // ================= PARAMETERS =================
-const int MAX_AP_TO_SEND = 5;
-const long sendInterval = 60000; // 60s
+const int MAX_AP_TO_SEND = 10;
+const long sendInterval = 50000; // 10s
+
 long lastSendTime = 0;
 
 // ================= GLOBALS =================
@@ -77,29 +78,61 @@ void sendCmd(String cmd) {
   LoRa.println(cmd);
 }
 
+void pollLoRa(unsigned long timeoutMs = 200) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    if (!LoRa.available()) {
+      delay(5);
+      continue;
+    }
+
+    String line = LoRa.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    Serial.print("LoRa received: ");
+    Serial.println(line);
+
+    if (line.indexOf("+JOIN: Success") >= 0 ||
+        line.indexOf("Network joined") >= 0) {
+      isJoined = true;
+      Serial.println("TTN Network joined successfully!");
+    }
+  }
+}
+
+
 // Join TTN via OTAA
 void joinTTN() {
   sendCmd("AT");
-  delay(500);
+  pollLoRa();
+
   sendCmd("AT+DR=EU868");
-  delay(500);
+  pollLoRa();
+
   sendCmd("AT+MODE=LWOTAA");
-  delay(500);
+  pollLoRa();
+
   sendCmd("AT+CLASS=A");
-  delay(500);
+  pollLoRa();
+
   sendCmd("AT+PORT=2");
-  delay(500);
+  pollLoRa();
 
   sendCmd("AT+ID=DevEui," + String(DEVEUI));
-  delay(500);
+  pollLoRa();
+
   sendCmd("AT+ID=AppEui," + String(APPEUI));
-  delay(500);
+  pollLoRa();
+
   sendCmd("AT+KEY=APPKEY," + String(APPKEY));
-  delay(500);
+  pollLoRa();
 
   Serial.println("Sending join request...");
   sendCmd("AT+JOIN");
+  pollLoRa(3000); // join can take time
 }
+
 
 // ================= SETUP =================
 void setup() {
@@ -146,7 +179,7 @@ void loop() {
       isJoined = true;
       Serial.println("TTN Network joined successfully!");
     }
-
+ 
   }
 
   // -------- 2 Wi-Fi must be connected --------
