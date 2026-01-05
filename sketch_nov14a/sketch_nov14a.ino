@@ -147,19 +147,6 @@ void loop() {
       Serial.println("TTN Network joined successfully!");
     }
 
-    int latIndex = line.indexOf("LAT:");
-    int lonIndex = line.indexOf("LON:");
-    if (latIndex >= 0 && lonIndex > latIndex) {
-      String latStr = line.substring(latIndex + 4, lonIndex - 1);
-      String lonStr = line.substring(lonIndex + 4);
-      latitude = latStr.toFloat();
-      longitude = lonStr.toFloat();
-      coordsReceived = true;
-      Serial.print("Coords parsed -> LAT: ");
-      Serial.print(latitude);
-      Serial.print(", LON: ");
-      Serial.println(longitude);
-    }
   }
 
   // -------- 2 Wi-Fi must be connected --------
@@ -224,26 +211,5 @@ void loop() {
   Serial.println(locatePayload);
   sendJson(LOCATE_URL, locatePayload);
 
-  // -------- 5 Send /scan/calibrate payload if coordinates available --------
-  if (coordsReceived) {
-    String calibratePayload = "{";
-    calibratePayload += "\"device_id\":\"" DEVICE_ID "\",";
-    calibratePayload += "\"scan\":" + scanJson + ",";
-    calibratePayload += "\"lat\":" + String(latitude, 6) + ",";
-    calibratePayload += "\"lon\":" + String(longitude, 6);
-    calibratePayload += "}";
-    Serial.println("--- Sending to /scan/calibrate ---");
-    Serial.println(calibratePayload);
-    sendJson(CALIBRATE_URL, calibratePayload);
 
-    coordsReceived = false; // reset after sending
-  }
-}
-
-// ================= MANUAL COORDS INPUT (optional) =================
-// You can call this function from Serial to inject GPS without LoRa
-void injectCoordinates(float lat, float lon) {
-  latitude = lat;
-  longitude = lon;
-  coordsReceived = true;
 }
