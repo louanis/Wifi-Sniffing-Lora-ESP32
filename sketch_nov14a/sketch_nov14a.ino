@@ -1,163 +1,249 @@
 #include <WiFi.h>
-#include "SPIFFS.h"
-#include <FS.h>
-#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <HardwareSerial.h>
 
-// ----------------- New: CSV / location storage -----------------
-const char* CSV_PATH = "/localBDD.csv";
-String currentLocation = "unknown_location";
+// ================= WIFI CONFIG =================
+#define WIFI_SSID     "Quoicoubeh"
+#define WIFI_PASSWORD "quoicouEchecScolaireBeh"
 
-void ensureCSVHeader() {
-  if (!SPIFFS.exists(CSV_PATH)) {
-    File f = SPIFFS.open(CSV_PATH, FILE_WRITE);
-    if (f) {
-      // Header: timestamp(ms),location,kept,ssid,bssid,rssi,channel
-      f.println("timestamp_ms,location,kept,ssid,bssid,rssi,channel");
-      f.close();
-    }
-  }
+// ================= API CONFIG =================
+#define DEVICE_ID "esp32-001"
+#define LOCATE_URL "http://87.88.146.8:8067/scan/locate"
+#define CALIBRATE_URL "http://87.88.146.8:8067/scan/calibrate"
+
+// ================= LORA CONFIG =================
+#define LORA_RX 16
+#define LORA_TX 17
+#define LORA_BAUD 9600
+
+#define APPEUI "0000000000000000"
+#define APPKEY "3D0D6AA79FA5CD474E71E9A92D533BCC"
+#define DEVEUI "70B3D57ED0073262"
+
+HardwareSerial LoRa(2);
+
+// ================= PARAMETERS =================
+const int MAX_AP_TO_SEND = 5;
+const long sendInterval = 60000; // 60s
+long lastSendTime = 0;
+
+// ================= GLOBALS =================
+bool coordsReceived = false;
+float latitude = 0.0;
+float longitude = 0.0;
+bool isJoined = false;
+
+// ================= HOTSPOT FILTER =================
+bool isLikelyHotspot(String ssid, uint8_t* bssid) {
+  uint8_t secondNibble = bssid[0] & 0x0F;
+  if (secondNibble == 0x2 || secondNibble == 0x6 ||
+      secondNibble == 0xA || secondNibble == 0xE) return true;
+
+  String s = ssid;
+  s.toUpperCase();
+  if (s.indexOf("IPHONE") >= 0) return true;
+  if (s.indexOf("ANDROID") >= 0) return true;
+  if (s.indexOf("GALAXY") >= 0) return true;
+  if (s.indexOf("HUAWEI") >= 0) return true;
+  if (s.indexOf("POCO") >= 0) return true;
+
+  return false;
 }
 
-String macToString(const uint8_t* mac) {
-  char buf[18];
-  sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  return String(buf);
+// ================= HTTP SEND =================
+void sendJson(String url, String json) {
+  HTTPClient http;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  int code = http.POST(json);
+  Serial.print("POST to ");
+  Serial.print(url);
+  Serial.print(" -> HTTP STATUS: ");
+  Serial.println(code);
+
+  if (code > 0) {
+    Serial.println("Server response:");
+    Serial.println(http.getString());
+  }
+
+  http.end();
 }
 
-void appendNetworkCSV(unsigned long ts, const String& location, bool kept, const String& ssid, const uint8_t* mac, int rssi, int channel) {
-  File f = SPIFFS.open(CSV_PATH, FILE_APPEND);
-  if (!f) return;
-  String line = "";
-  line += String(ts);
-  line += ",";
-  // escape commas in location/ssid minimally by wrapping quotes if needed
-  if (location.indexOf(',') >= 0 || location.indexOf('"') >= 0) {
-    line += "\"" + location + "\"";
-  } else {
-    line += location;
-  }
-  line += ",";
-  line += (kept ? "1" : "0");
-  line += ",";
-  if (ssid.indexOf(',') >= 0 || ssid.indexOf('"') >= 0) {
-    line += "\"" + ssid + "\"";
-  } else {
-    line += ssid;
-  }
-  line += ",";
-  line += macToString(mac);
-  line += ",";
-  line += String(rssi);
-  line += ",";
-  line += String(channel);
-  f.println(line);
-  f.close();
+// ================= LORA UTILS =================
+void sendCmd(String cmd) {
+  Serial.print("CMD> ");
+  Serial.println(cmd);
+  LoRa.println(cmd);
 }
 
-// Parse serial commands: "loc <label>" sets currentLocation
-void handleSerialCommands() {
-  if (!Serial.available()) return;
-  String s = Serial.readStringUntil('\n');
-  s.trim();
-  if (s.length() == 0) return;
-  if (s.startsWith("loc ")) {
-    String loc = s.substring(4);
-    loc.trim();
-    if (loc.length() > 0) {
-      currentLocation = loc;
-      Serial.print("Location set to: ");
-      Serial.println(currentLocation);
-    }
-  } else if (s == "showcsv") {
-    // dump CSV to serial (small helper)
-    if (SPIFFS.exists(CSV_PATH)) {
-      File f = SPIFFS.open(CSV_PATH, FILE_READ);
-      if (f) {
-        Serial.println("=== CSV DUMP ===");
-        while (f.available()) {
-          Serial.write(f.read());
-        }
-        Serial.println("\n=== END CSV ===");
-        f.close();
-      }
-    } else {
-      Serial.println("CSV file not found.");
-    }
-  } else {
-    Serial.println("Unknown command. Use: loc <label>  or  showcsv");
-  }
-}
-// ----------------- End CSV / location code -----------------
+// Join TTN via OTAA
+void joinTTN() {
+  sendCmd("AT");
+  delay(500);
+  sendCmd("AT+DR=EU868");
+  delay(500);
+  sendCmd("AT+MODE=LWOTAA");
+  delay(500);
+  sendCmd("AT+CLASS=A");
+  delay(500);
+  sendCmd("AT+PORT=2");
+  delay(500);
 
+  sendCmd("AT+ID=DevEui," + String(DEVEUI));
+  delay(500);
+  sendCmd("AT+ID=AppEui," + String(APPEUI));
+  delay(500);
+  sendCmd("AT+KEY=APPKEY," + String(APPKEY));
+  delay(500);
+
+  Serial.println("Sending join request...");
+  sendCmd("AT+JOIN");
+}
+
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  delay(1000);
 
-  // Initialize SPIFFS
-  if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS mount failed");
+  // Wi-Fi setup
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi CONNECTED!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
   } else {
-    ensureCSVHeader();
+    Serial.println("WiFi FAILED TO CONNECT");
   }
 
-  Serial.println("\n\nWiFi Localization Filter System");
-  Serial.println("Use 'loc <label>' to set current location (e.g. loc floor1_roomA)");
-  Serial.println("Use 'showcsv' to dump saved CSV");
+  // LoRa setup (optional)
+  LoRa.begin(LORA_BAUD, SERIAL_8N1, LORA_RX, LORA_TX);
+  Serial.println("LoRa initialized");
 
-  // WiFi setup
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(100);
+  joinTTN();
 }
 
+// ================= LOOP =================
 void loop() {
-  handleSerialCommands();
+  // -------- 1️⃣ Check LoRa for coordinates --------
+  while (LoRa.available()) {
+    String line = LoRa.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
 
-  Serial.println("\nScanning...");
+    Serial.print("LoRa received: ");
+    Serial.println(line);
 
-  int n = WiFi.scanNetworks(false, true);  // scan, include hidden networks
+    if (line.indexOf("Network joined") >= 0 || line.indexOf("+JOIN: Success") >= 0) {
+      isJoined = true;
+      Serial.println("TTN Network joined successfully!");
+    }
+
+    int latIndex = line.indexOf("LAT:");
+    int lonIndex = line.indexOf("LON:");
+    if (latIndex >= 0 && lonIndex > latIndex) {
+      String latStr = line.substring(latIndex + 4, lonIndex - 1);
+      String lonStr = line.substring(lonIndex + 4);
+      latitude = latStr.toFloat();
+      longitude = lonStr.toFloat();
+      coordsReceived = true;
+      Serial.print("Coords parsed -> LAT: ");
+      Serial.print(latitude);
+      Serial.print(", LON: ");
+      Serial.println(longitude);
+    }
+  }
+
+  // -------- 2️⃣ Wi-Fi must be connected --------
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  // -------- 3️⃣ Send Wi-Fi scan every interval --------
+  long now = millis();
+  if (now - lastSendTime < sendInterval) return;
+  lastSendTime = now;
+
+  Serial.println("\n--- WiFi Scan ---");
+  int n = WiFi.scanNetworks(false, true);
   if (n <= 0) {
-    Serial.println("No networks found.");
-    delay(5000);
+    Serial.println("No networks found");
     return;
   }
 
-  // Prepare JSON document
-  StaticJsonDocument<4096> doc;
-  JsonArray networks = doc.createNestedArray("networks");
-  doc["timestamp"] = millis();
+  String scanJson = "[";
+  int validCount = 0;
+  for (int i = 0; i < n && validCount < MAX_AP_TO_SEND; i++) {
+    String ssid = WiFi.SSID(i);
+    uint8_t* bssid = WiFi.BSSID(i);
+    if (isLikelyHotspot(ssid, bssid)) continue;
 
-  Serial.printf("%d networks found\n", n);
+    if (validCount > 0) scanJson += ",";
 
-  for (int i = 0; i < n; i++) {
-    JsonObject ap = networks.createNestedObject();
-    ap["ssid"] = WiFi.SSID(i);
-    ap["bssid"] = WiFi.BSSIDstr(i);
-    ap["rssi"] = WiFi.RSSI(i);
-    ap["channel"] = WiFi.channel(i);
-    ap["encryption"] = WiFi.encryptionType(i);
+    char mac[18];
+    sprintf(mac, "%02X:%02X:%02X:%02X:%02X:%02X",
+            bssid[0], bssid[1], bssid[2],
+            bssid[3], bssid[4], bssid[5]);
 
-    // Debug print
-    Serial.printf(
-      "SSID: %s | BSSID: %s | RSSI: %d | CH: %d | ENC: %d\n",
-      WiFi.SSID(i).c_str(),
-      WiFi.BSSIDstr(i).c_str(),
-      WiFi.RSSI(i),
-      WiFi.channel(i),
-      WiFi.encryptionType(i)
-    );
+    scanJson += "{";
+    scanJson += "\"mac\":\"";
+    scanJson += mac;
+    scanJson += "\",\"rssi\":";
+    scanJson += WiFi.RSSI(i);
+    scanJson += "}";
 
-    // Save every detected AP to CSV with kept flag (kept determined below)
-    bool kept = true; // Placeholder for actual filtering logic
-    appendNetworkCSV(millis(), currentLocation, kept, WiFi.SSID(i), WiFi.BSSID(i), WiFi.RSSI(i), WiFi.channel(i));
+    Serial.print(validCount);
+    Serial.print(": ");
+    Serial.print(ssid);
+    Serial.print(" (");
+    Serial.print(WiFi.RSSI(i));
+    Serial.print(" dBm) MAC: ");
+    Serial.println(mac);
+
+    validCount++;
+  }
+  scanJson += "]";
+
+  if (validCount == 0) {
+    Serial.println("No valid fixed APs");
+    return;
   }
 
-  // Print JSON output
-  String jsonOut;
-  serializeJson(doc, jsonOut);
-  Serial.println("\nJSON Output:");
-  Serial.println(jsonOut);
+  // -------- 4️⃣ Send /scan/locate payload --------
+  String locatePayload = "{";
+  locatePayload += "\"device_id\":\"" DEVICE_ID "\",";
+  locatePayload += "\"scan\":" + scanJson;
+  locatePayload += "}";
+  Serial.println("--- Sending to /scan/locate ---");
+  Serial.println(locatePayload);
+  sendJson(LOCATE_URL, locatePayload);
 
-  // Wait 5 seconds before next scan
-  delay(5000);
+  // -------- 5️⃣ Send /scan/calibrate payload if coordinates available --------
+  if (coordsReceived) {
+    String calibratePayload = "{";
+    calibratePayload += "\"device_id\":\"" DEVICE_ID "\",";
+    calibratePayload += "\"scan\":" + scanJson + ",";
+    calibratePayload += "\"lat\":" + String(latitude, 6) + ",";
+    calibratePayload += "\"lon\":" + String(longitude, 6);
+    calibratePayload += "}";
+    Serial.println("--- Sending to /scan/calibrate ---");
+    Serial.println(calibratePayload);
+    sendJson(CALIBRATE_URL, calibratePayload);
+
+    coordsReceived = false; // reset after sending
+  }
+}
+
+// ================= MANUAL COORDS INPUT (optional) =================
+// You can call this function from Serial to inject GPS without LoRa
+void injectCoordinates(float lat, float lon) {
+  latitude = lat;
+  longitude = lon;
+  coordsReceived = true;
 }
