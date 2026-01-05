@@ -133,7 +133,7 @@ void setup() {
 
 // ================= LOOP =================
 void loop() {
-  // -------- 1️⃣ Check LoRa for coordinates --------
+  // -------- 1 Check LoRa for coordinates --------
   while (LoRa.available()) {
     String line = LoRa.readStringUntil('\n');
     line.trim();
@@ -162,10 +162,10 @@ void loop() {
     }
   }
 
-  // -------- 2️⃣ Wi-Fi must be connected --------
+  // -------- 2 Wi-Fi must be connected --------
   if (WiFi.status() != WL_CONNECTED) return;
 
-  // -------- 3️⃣ Send Wi-Fi scan every interval --------
+  // -------- 3 Send Wi-Fi scan every interval --------
   long now = millis();
   if (now - lastSendTime < sendInterval) return;
   lastSendTime = now;
@@ -215,7 +215,7 @@ void loop() {
     return;
   }
 
-  // -------- 4️⃣ Send /scan/locate payload --------
+  // -------- 4 Send /scan/locate payload --------
   String locatePayload = "{";
   locatePayload += "\"device_id\":\"" DEVICE_ID "\",";
   locatePayload += "\"scan\":" + scanJson;
@@ -224,7 +224,7 @@ void loop() {
   Serial.println(locatePayload);
   sendJson(LOCATE_URL, locatePayload);
 
-  // -------- 5️⃣ Send /scan/calibrate payload if coordinates available --------
+  // -------- 5 Send /scan/calibrate payload if coordinates available --------
   if (coordsReceived) {
     String calibratePayload = "{";
     calibratePayload += "\"device_id\":\"" DEVICE_ID "\",";
