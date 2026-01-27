@@ -200,22 +200,40 @@ async def locate(request: Request, session: Session = Depends(get_session)):
 # -----------------------------
 @app.get("/map/{device_id}", response_class=HTMLResponse)
 def show_map(device_id: str, session: Session = Depends(get_session)):
+
+    # 1. Exact device match
     if device_id in last_estimated_positions:
         lat, lon = last_estimated_positions[device_id]
-        label, color = "Estimated position", "red"
+        label = f"Estimated position ({device_id})"
+        color = "red"
+
+    # 2. Fallback: last estimated position from ANY device
+    elif last_estimated_positions:
+        last_device, (lat, lon) = next(reversed(last_estimated_positions.items()))
+        label = f"Estimated position ({last_device})"
+        color = "orange"
+
+    # 3. Fallback: last calibration point
     else:
-        fp = session.exec(select(Fingerprint).order_by(Fingerprint.id.desc())).first()
+        fp = session.exec(
+            select(Fingerprint).order_by(Fingerprint.id.desc())
+        ).first()
+
         if fp:
             lat, lon = fp.lat, fp.lon
-            label, color = "Calibration point", "blue"
+            label = "Last calibration point"
+            color = "blue"
         else:
-            lat, lon = 48.8566, 2.3522
-            label, color = "Default", "gray"
+            lat, lon = 48.8566
+            lon = 2.3522
+            label = "Default"
+            color = "gray"
 
     m = folium.Map(location=[lat, lon], zoom_start=17)
+
     folium.Marker(
         [lat, lon],
-        popup=f"{label}<br>{lat}, {lon}",
+        popup=f"{label}<br>Lat: {lat}<br>Lon: {lon}",
         icon=folium.Icon(color=color)
     ).add_to(m)
 
