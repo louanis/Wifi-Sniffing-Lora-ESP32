@@ -229,15 +229,30 @@ def show_map(device_id: str, session: Session = Depends(get_session)):
             label = "Default"
             color = "gray"
 
+    # Create Folium map
     m = folium.Map(location=[lat, lon], zoom_start=17)
 
+    # Add marker
     folium.Marker(
         [lat, lon],
         popup=f"{label}<br>Lat: {lat}<br>Lon: {lon}",
         icon=folium.Icon(color=color)
     ).add_to(m)
 
-    return m._repr_html_()
+    # Get HTML
+    html = m._repr_html_()
+
+    # Inject auto-refresh JS (every 3 seconds)
+    auto_refresh = """
+    <script>
+    setTimeout(function(){
+        window.location.reload();
+    }, 3000);
+    </script>
+    """
+    
+    return html.replace("</body>", auto_refresh + "</body>")
+
 
 # -----------------------------
 # Root
