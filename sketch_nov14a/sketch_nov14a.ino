@@ -17,14 +17,14 @@
 #define LORA_BAUD 9600
 
 #define APPEUI "0000000000000000"
-#define APPKEY "3D0D6AA79FA5CD474E71E9A92D533BCC"
-#define DEVEUI "70B3D57ED0073262"
+#define APPKEY "70B133580F2B5C934A9E85E2C79FFA0A"
+#define DEVEUI "70B3D57ED0075031"
 
 HardwareSerial LoRa(2);
 
 // ================= PARAMETERS =================
 const int MAX_AP_TO_SEND = 10;
-const long sendInterval = 10000; // 10s
+const long sendInterval = 5000; // 10s
 
 long lastSendTime = 0;
 
@@ -54,12 +54,14 @@ bool isLikelyHotspot(String ssid, uint8_t* bssid) {
 // =================  SEND =================
 
 void sendCmd(String cmd) {
-  Serial.print("CMD> ");
-  Serial.println(cmd);
+  Serial.println("CMD > " + cmd);
   LoRa.println(cmd);
 }
 
-
+void sendHexPayload(String hexData) {
+  Serial.println("Envoi LoRa : " + hexData);
+  sendCmd("AT+MSGHEX=" + hexData);
+}
 
 void sendJson(String url, String json) {
   HTTPClient http;
@@ -81,11 +83,6 @@ void sendJson(String url, String json) {
 }
 
 // ================= LORA UTILS =================
-void sendCmd(String cmd) {
-  Serial.print("CMD> ");
-  Serial.println(cmd);
-  LoRa.println(cmd);
-}
 
 void pollLoRa(unsigned long timeoutMs = 200) {
   unsigned long start = millis();
@@ -177,6 +174,7 @@ int packScanData(uint8_t* buffer, int maxLen) {
 
 
 
+
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
@@ -241,25 +239,69 @@ void loop() {
   }
 
   // -------- 4. Dual-mode send --------
-  if (isJoined) {
-    // ===== LoRaWAN send =====
-    uint8_t payload[51];
-    int len = packScanData(payload, 51);
+  // ================= LORA SEND PART =================
+if(isJoined) {
 
-    Serial.print("--- Sending payload over TTN, length: ");
-    Serial.println(len);
+    Serial.println("\n--- WiFi Scan for LoRa ---");
+    int n = WiFi.scanNetworks(false, true);
+    if(n == 0){ Serial.println("No networks"); return; }
 
-    // Optional: print payload for debug
-    Serial.print("Payload bytes: ");
-    for (int i = 0; i < len; i++) {
-      Serial.print(payload[i], HEX);
-      Serial.print(" ");
+    uint8_t payload[64];
+    int idx = 0;
+
+    // --- HEADER + timestamp ---
+    payload[idx++] = 0x55; // header marker
+    uint16_t ts = millis() / 1000;
+    payload[idx++] = (ts >> 8) & 0xFF;
+    payload[idx++] = ts & 0xFF;
+
+    // Reserve byte for AP count
+    int countIndex = idx++;
+    int validAPCount = 0;
+
+    // --- Take only up to 3 valid APs ---
+    for(int i = 0; i < n && validAPCount < 3; i++) {
+        String ssid = WiFi.SSID(i);
+        uint8_t* bssid = WiFi.BSSID(i);
+        if(isLikelyHotspot(ssid, bssid)) continue;
+
+        // MAC (6 bytes)
+        for(int k = 0; k < 6; k++) payload[idx++] = bssid[k];
+
+        // RSSI (1 byte)
+        payload[idx++] = (uint8_t)WiFi.RSSI(i);
+
+        validAPCount++;
     }
-    Serial.println();
 
-    LoRa.write(payload, len);
-    sendCmd("AT+SEND=2," + String(len));
-  } else {
+    // Write real number of APs
+    payload[countIndex] = validAPCount;
+
+    if(validAPCount > 0) {
+        // Convert to HEX string for AT+MSGHEX
+        String hexPayload = "";
+        for(int i = 0; i < idx; i++) {
+            if(payload[i] < 16) hexPayload += "0";
+            hexPayload += String(payload[i], HEX);
+        }
+        hexPayload.toUpperCase();
+
+        // Send via LoRa
+        LoRa.println("AT+MSGHEX=" + hexPayload);  // send to LoRa
+        Serial.println("Sent payload (HEX): " + hexPayload);  // print what was sent
+
+        
+        delay(50);
+        while(LoRa.available()) {
+            String resp = LoRa.readStringUntil('\n');
+            resp.trim();
+            if(resp.length() > 0) Serial.println("LoRa resp: " + resp);
+        }
+
+        Serial.println("LoRa payload sent with " + String(validAPCount) + " APs");
+    }
+    
+} else {
     // ===== Fallback HTTP send =====
     String scanJson = "[";
     int validCount = 0;
