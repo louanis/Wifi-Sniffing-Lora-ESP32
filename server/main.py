@@ -1,21 +1,13 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Dict, Tuple
 from math import sqrt
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 import folium
-from fastapi import Request
-
-
-from time import time
-
-lora_buffers = {}  # device_id -> buffer
-LORA_TIMEOUT = 15  # seconds
-
 
 # -----------------------------
-# Database setup (SQLite)
+# Database setup
 # -----------------------------
 DATABASE_FILE = "fingerprints.db"
 engine = create_engine(f"sqlite:///{DATABASE_FILE}", echo=False)
@@ -34,16 +26,15 @@ class FingerprintEntry(SQLModel, table=True):
     mac: str
     rssi: int
 
-# Create tables if not exist
 SQLModel.metadata.create_all(engine)
 
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="Wi-Fi Fingerprinting Server with Map")
+app = FastAPI(title="Wi-Fi Fingerprinting Server")
 
 # -----------------------------
-# Pydantic models
+# Internal normalized models
 # -----------------------------
 class WifiReading(BaseModel):
     mac: str
@@ -59,143 +50,129 @@ class CalibrationRequest(BaseModel):
     lon: float
 
 # -----------------------------
-# Dependency: session generator
+# State
+# -----------------------------
+pending_calibrations: Dict[str, Tuple[float, float]] = {}
+last_estimated_positions: Dict[str, Tuple[float, float]] = {}
+
+# -----------------------------
+# DB session
 # -----------------------------
 def get_session():
     with Session(engine) as session:
         yield session
 
 # -----------------------------
-# Pending calibration storage
+# Payload normalizer (THE FIX)
 # -----------------------------
-# Store device_id -> coordinates until next scan arrives
-pending_calibrations: Dict[str, Tuple[float, float]] = {}
+def extract_wifi_scan(payload: dict) -> WifiScan:
+    """
+    Accepts:
+    - decoded payload directly
+    - full TTN webhook payload
+    Returns normalized WifiScan
+    """
 
-# Store last estimated position per device
-last_estimated_positions: Dict[str, Tuple[float, float]] = {}
+    # Case 1: decoded payload directly
+    if "device_id" in payload and "scan" in payload:
+        return WifiScan(**payload)
 
+    # Case 2: TTN webhook
+    try:
+        decoded = payload["data"]["uplink_message"]["decoded_payload"]
+        return WifiScan(**decoded)
+    except Exception:
+        pass
+
+    raise HTTPException(
+        status_code=400,
+        detail="Invalid payload: no decoded Wi-Fi scan found"
+    )
 
 # -----------------------------
 # Calibration endpoint
 # -----------------------------
 @app.post("/scan/calibrate")
-def calibrate(req: CalibrationRequest):
-    """
-    Receive device_id + coordinates and store them in memory.
-    The next /scan/locate payload from this device will be saved in the database.
-    """
+async def calibrate(request: Request):
+    payload = await request.json()
+
+    try:
+        req = CalibrationRequest(**payload)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid calibration payload")
+
     pending_calibrations[req.device_id] = (req.lat, req.lon)
+
     return {
         "status": "pending",
         "device_id": req.device_id,
         "lat": req.lat,
-        "lon": req.lon,
-        "message": "Next Wi-Fi scan from this device will be linked to these coordinates"
+        "lon": req.lon
     }
-
-
 
 # -----------------------------
 # Locate endpoint
 # -----------------------------
 @app.post("/scan/locate")
-def locate(scan: WifiScan = None, request: Request = None, session: Session = Depends(get_session)):
-
-    """
-    Compare live scan against stored fingerprints and estimate position.
-    If calibration pending for this device, save the fingerprint first.
-    """
-
-
-   # ----- Decide which payload to use -----
-    if scan is None and request is not None:
-        import json
-        try:
-            body = json.loads(request.body())
-        except Exception:
-            body = None
-
-        if isinstance(body, list):
-            uplink_event = next((e for e in body if e.get("name") == "as.up.data.forward"), None)
-            if uplink_event:
-                decoded = uplink_event["data"]["uplink_message"]["decoded_payload"]
-                scan = WifiScan(
-                    device_id=decoded.get("device_id", "unknown"),
-                    scan=[WifiReading(mac=ap["mac"], rssi=ap["rssi"]) for ap in decoded.get("scan", [])],
-                    timestamp=decoded.get("timestamp", 0)
-                )
-
-    # ----- Make sure scan is valid -----
-    if scan is None:
-        return {"status": "error", "message": "No valid scan provided"}
-
+async def locate(request: Request, session: Session = Depends(get_session)):
+    payload = await request.json()
+    scan = extract_wifi_scan(payload)
 
     scan_fp = {ap.mac: ap.rssi for ap in scan.scan}
 
-    # ----------- Store fingerprint if calibration is pending -----------
+    # ----- Calibration save -----
     if scan.device_id in pending_calibrations:
         lat, lon = pending_calibrations.pop(scan.device_id)
-        fingerprint = Fingerprint(lat=lat, lon=lon)
-        session.add(fingerprint)
+        fp = Fingerprint(lat=lat, lon=lon)
+        session.add(fp)
         session.commit()
-        session.refresh(fingerprint)
+        session.refresh(fp)
 
         for ap in scan.scan:
-            entry = FingerprintEntry(
-                fingerprint_id=fingerprint.id,
+            session.add(FingerprintEntry(
+                fingerprint_id=fp.id,
                 mac=ap.mac,
                 rssi=ap.rssi
-            )
-            session.add(entry)
+            ))
         session.commit()
-        print(f"[INFO] Calibration saved for device {scan.device_id} at ({lat}, {lon})")
 
-    # ----------- Estimate position -----------
+    # ----- Position estimation -----
     fingerprints = session.exec(select(Fingerprint)).all()
     if not fingerprints:
-        return {
-            "status": "pending",
-            "message": "No fingerprints in database. Calibrate first."
-        }
+        return {"status": "pending", "message": "No fingerprints yet"}
 
-    weighted_lat = 0.0
-    weighted_lon = 0.0
-    total_weight = 0.0
+    weighted_lat = weighted_lon = total_weight = 0.0
 
     for fp in fingerprints:
         entries = session.exec(
-            select(FingerprintEntry).where(FingerprintEntry.fingerprint_id == fp.id)
+            select(FingerprintEntry).where(
+                FingerprintEntry.fingerprint_id == fp.id
+            )
         ).all()
-        db_fp = {e.mac: e.rssi for e in entries}
 
-        # Only consider common MACs
-        common_macs = set(scan_fp.keys()) & set(db_fp.keys())
-        if not common_macs:
+        db_fp = {e.mac: e.rssi for e in entries}
+        common = set(scan_fp) & set(db_fp)
+        if not common:
             continue
 
-        # Euclidean distance
-        distance = sqrt(sum((scan_fp[mac] - db_fp[mac]) ** 2 for mac in common_macs))
-        weight = 1 / (distance + 0.01)  # avoid division by 0
+        dist = sqrt(sum((scan_fp[m] - db_fp[m]) ** 2 for m in common))
+        weight = 1 / (dist + 0.01)
 
         weighted_lat += weight * fp.lat
         weighted_lon += weight * fp.lon
         total_weight += weight
 
     if total_weight == 0:
-        return {
-            "status": "pending",
-            "message": "No matching fingerprints found. Send Wi-Fi scan after calibration."
-        }
+        return {"status": "pending", "message": "No matching fingerprints"}
 
-    estimated_lat = weighted_lat / total_weight
-    estimated_lon = weighted_lon / total_weight
+    lat = weighted_lat / total_weight
+    lon = weighted_lon / total_weight
 
-    # Save last estimated position for this device
-    last_estimated_positions[scan.device_id] = (estimated_lat, estimated_lon)
+    last_estimated_positions[scan.device_id] = (lat, lon)
 
     return {
         "status": "ok",
-        "estimated_position": {"lat": estimated_lat, "lon": estimated_lon}
+        "estimated_position": {"lat": lat, "lon": lon}
     }
 
 # -----------------------------
@@ -203,57 +180,30 @@ def locate(scan: WifiScan = None, request: Request = None, session: Session = De
 # -----------------------------
 @app.get("/map/{device_id}", response_class=HTMLResponse)
 def show_map(device_id: str, session: Session = Depends(get_session)):
-
-    # If we have an estimated position → use it
     if device_id in last_estimated_positions:
         lat, lon = last_estimated_positions[device_id]
-        center_lat, center_lon = lat, lon
-        marker_label = "Estimated position"
-        marker_color = "red"
-
-    # Else fallback to last calibration point
+        label, color = "Estimated position", "red"
     else:
-        latest_fp = session.exec(
-            select(Fingerprint).order_by(Fingerprint.id.desc())
-        ).first()
-
-        if latest_fp:
-            center_lat = latest_fp.lat
-            center_lon = latest_fp.lon
-            marker_label = "Calibration point"
-            marker_color = "blue"
+        fp = session.exec(select(Fingerprint).order_by(Fingerprint.id.desc())).first()
+        if fp:
+            lat, lon = fp.lat, fp.lon
+            label, color = "Calibration point", "blue"
         else:
-            center_lat = 48.8566
-            center_lon = 2.3522
-            marker_label = "Default"
-            marker_color = "gray"
+            lat, lon = 48.8566, 2.3522
+            label, color = "Default", "gray"
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=17)
-
+    m = folium.Map(location=[lat, lon], zoom_start=17)
     folium.Marker(
-        [center_lat, center_lon],
-        tooltip=f"Device: {device_id}",
-        popup=f"{marker_label}<br>Lat: {center_lat}<br>Lon: {center_lon}",
-        icon=folium.Icon(color=marker_color, icon="info-sign")
+        [lat, lon],
+        popup=f"{label}<br>{lat}, {lon}",
+        icon=folium.Icon(color=color)
     ).add_to(m)
 
-    html = m._repr_html_()
-
-    auto_refresh = """
-    <script>
-    setTimeout(function(){
-        window.location.reload();
-    }, 3000);
-    </script>
-    """
-    
-    return html.replace("</body>", auto_refresh + "</body>")
-    
-
+    return m._repr_html_()
 
 # -----------------------------
-# Root endpoint
+# Root
 # -----------------------------
 @app.get("/")
 def root():
-    return {"message": "Wi-Fi Fingerprinting Server with SQLite Online"}
+    return {"status": "online"}
