@@ -97,35 +97,37 @@ def calibrate(req: CalibrationRequest):
 # Locate endpoint
 # -----------------------------
 @app.post("/scan/locate")
-def locate(scan: WifiScan, session: Session = Depends(get_session)):
+def locate(scan: WifiScan = None, request: Request = None, session: Session = Depends(get_session)):
+
     """
     Compare live scan against stored fingerprints and estimate position.
     If calibration pending for this device, save the fingerprint first.
     """
 
 
-    # ---------- Detect TTNv3 uplink ----------
+   # ----- Decide which payload to use -----
     if scan is None and request is not None:
-        body = await request.json()
+        import json
+        try:
+            body = json.loads(request.body())
+        except Exception:
+            body = None
 
-        # TTNv3 sends an array of events
         if isinstance(body, list):
             uplink_event = next((e for e in body if e.get("name") == "as.up.data.forward"), None)
             if uplink_event:
                 decoded = uplink_event["data"]["uplink_message"]["decoded_payload"]
-
-                # Convert to WifiScan
                 scan = WifiScan(
                     device_id=decoded.get("device_id", "unknown"),
                     scan=[WifiReading(mac=ap["mac"], rssi=ap["rssi"]) for ap in decoded.get("scan", [])],
                     timestamp=decoded.get("timestamp", 0)
                 )
 
-    # If still None, reject
+    # ----- Make sure scan is valid -----
     if scan is None:
         return {"status": "error", "message": "No valid scan provided"}
 
-        
+
     scan_fp = {ap.mac: ap.rssi for ap in scan.scan}
 
     # ----------- Store fingerprint if calibration is pending -----------
