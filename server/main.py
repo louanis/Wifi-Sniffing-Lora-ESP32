@@ -201,57 +201,45 @@ async def locate(request: Request, session: Session = Depends(get_session)):
 @app.get("/map/{device_id}", response_class=HTMLResponse)
 def show_map(device_id: str, session: Session = Depends(get_session)):
 
-    # 1. Exact device match
+    # Determine device position
     if device_id in last_estimated_positions:
         lat, lon = last_estimated_positions[device_id]
         label = f"Estimated position ({device_id})"
         color = "red"
-
-    # 2. Fallback: last estimated position from ANY device
     elif last_estimated_positions:
         last_device, (lat, lon) = next(reversed(last_estimated_positions.items()))
         label = f"Estimated position ({last_device})"
         color = "orange"
-
-    # 3. Fallback: last calibration point
     else:
         fp = session.exec(
             select(Fingerprint).order_by(Fingerprint.id.desc())
         ).first()
-
         if fp:
             lat, lon = fp.lat, fp.lon
             label = "Last calibration point"
             color = "blue"
         else:
-            lat, lon = 48.8566
-            lon = 2.3522
+            lat, lon = 48.8566, 2.3522
             label = "Default"
             color = "gray"
 
     # Create Folium map
     m = folium.Map(location=[lat, lon], zoom_start=17)
-
-    # Add marker
     folium.Marker(
         [lat, lon],
         popup=f"{label}<br>Lat: {lat}<br>Lon: {lon}",
         icon=folium.Icon(color=color)
     ).add_to(m)
 
-    # Get HTML
-    html = m._repr_html_()
+    # Instead of _repr_html_(), save HTML to string
+    html_str = m.get_root().render()
 
-    # Inject auto-refresh JS (every 3 seconds)
-    auto_refresh = """
-    <script>
-    setTimeout(function(){
-        window.location.reload();
-    }, 3000);
-    </script>
-    """
-    
-    return html.replace("</body>", auto_refresh + "</body>")
+    # Inject a reliable meta refresh tag in the <head>
+    refresh_tag = '<meta http-equiv="refresh" content="3">'  # 3 seconds
+    html_str = html_str.replace("<head>", f"<head>{refresh_tag}")
+
+    return HTMLResponse(content=html_str)
+
 
 
 # -----------------------------
