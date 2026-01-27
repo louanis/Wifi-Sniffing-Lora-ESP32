@@ -67,27 +67,47 @@ def get_session():
 # -----------------------------
 def extract_wifi_scan(payload: dict) -> WifiScan:
     """
-    Accepts:
-    - decoded payload directly
-    - full TTN webhook payload
-    Returns normalized WifiScan
+    Accept decoded-only payload OR full TTN webhook payload.
     """
 
-    # Case 1: decoded payload directly
-    if "device_id" in payload and "scan" in payload:
+    # Case 1: already decoded payload
+    if isinstance(payload, dict) and "device_id" in payload and "scan" in payload:
         return WifiScan(**payload)
 
-    # Case 2: TTN webhook
-    try:
-        decoded = payload["data"]["uplink_message"]["decoded_payload"]
-        return WifiScan(**decoded)
-    except Exception:
-        pass
+    decoded = None
 
-    raise HTTPException(
-        status_code=400,
-        detail="Invalid payload: no decoded Wi-Fi scan found"
+    # Case 2: TTN standard webhook
+    decoded = (
+        payload.get("data", {})
+               .get("uplink_message", {})
+               .get("decoded_payload")
     )
+
+    # Case 3: alternate TTN layout
+    if decoded is None:
+        decoded = (
+            payload.get("uplink_message", {})
+                   .get("decoded_payload")
+        )
+
+    # Case 4: last resort
+    if decoded is None:
+        decoded = payload.get("decoded_payload")
+
+    # Validate decoded payload
+    if not isinstance(decoded, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="No decoded_payload found in TTN webhook"
+        )
+
+    if "device_id" not in decoded or "scan" not in decoded:
+        raise HTTPException(
+            status_code=400,
+            detail="decoded_payload missing device_id or scan"
+        )
+
+    return WifiScan(**decoded)
 
 # -----------------------------
 # Calibration endpoint
