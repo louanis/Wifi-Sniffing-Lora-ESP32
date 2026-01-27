@@ -6,6 +6,12 @@ from math import sqrt
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 import folium
 
+from time import time
+
+lora_buffers = {}  # device_id -> buffer
+LORA_TIMEOUT = 15  # seconds
+
+
 # -----------------------------
 # Database setup (SQLite)
 # -----------------------------
@@ -63,6 +69,10 @@ def get_session():
 # Store device_id -> coordinates until next scan arrives
 pending_calibrations: Dict[str, Tuple[float, float]] = {}
 
+# Store last estimated position per device
+last_estimated_positions: Dict[str, Tuple[float, float]] = {}
+
+
 # -----------------------------
 # Calibration endpoint
 # -----------------------------
@@ -80,6 +90,8 @@ def calibrate(req: CalibrationRequest):
         "lon": req.lon,
         "message": "Next Wi-Fi scan from this device will be linked to these coordinates"
     }
+
+
 
 # -----------------------------
 # Locate endpoint
@@ -150,6 +162,9 @@ def locate(scan: WifiScan, session: Session = Depends(get_session)):
     estimated_lat = weighted_lat / total_weight
     estimated_lon = weighted_lon / total_weight
 
+    # Save last estimated position for this device
+    last_estimated_positions[scan.device_id] = (estimated_lat, estimated_lon)
+
     return {
         "status": "ok",
         "estimated_position": {"lat": estimated_lat, "lon": estimated_lon}
@@ -160,28 +175,53 @@ def locate(scan: WifiScan, session: Session = Depends(get_session)):
 # -----------------------------
 @app.get("/map/{device_id}", response_class=HTMLResponse)
 def show_map(device_id: str, session: Session = Depends(get_session)):
-    latest_fp = session.exec(
-        select(Fingerprint).order_by(Fingerprint.id.desc())
-    ).first()
 
-    if latest_fp:
-        center_lat = latest_fp.lat
-        center_lon = latest_fp.lon
+    # If we have an estimated position → use it
+    if device_id in last_estimated_positions:
+        lat, lon = last_estimated_positions[device_id]
+        center_lat, center_lon = lat, lon
+        marker_label = "Estimated position"
+        marker_color = "red"
+
+    # Else fallback to last calibration point
     else:
-        center_lat = 48.8566
-        center_lon = 2.3522
+        latest_fp = session.exec(
+            select(Fingerprint).order_by(Fingerprint.id.desc())
+        ).first()
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=16)
+        if latest_fp:
+            center_lat = latest_fp.lat
+            center_lon = latest_fp.lon
+            marker_label = "Calibration point"
+            marker_color = "blue"
+        else:
+            center_lat = 48.8566
+            center_lon = 2.3522
+            marker_label = "Default"
+            marker_color = "gray"
 
-    if latest_fp:
-        folium.Marker(
-            [latest_fp.lat, latest_fp.lon],
-            tooltip=f"Device: {device_id}",
-            popup=f"Lat: {latest_fp.lat}, Lon: {latest_fp.lon}",
-            icon=folium.Icon(color="red", icon="info-sign")
-        ).add_to(m)
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=17)
 
-    return m._repr_html_()
+    folium.Marker(
+        [center_lat, center_lon],
+        tooltip=f"Device: {device_id}",
+        popup=f"{marker_label}<br>Lat: {center_lat}<br>Lon: {center_lon}",
+        icon=folium.Icon(color=marker_color, icon="info-sign")
+    ).add_to(m)
+
+    html = m._repr_html_()
+
+    auto_refresh = """
+    <script>
+    setTimeout(function(){
+        window.location.reload();
+    }, 3000);
+    </script>
+    """
+    
+    return html.replace("</body>", auto_refresh + "</body>")
+    
+
 
 # -----------------------------
 # Root endpoint

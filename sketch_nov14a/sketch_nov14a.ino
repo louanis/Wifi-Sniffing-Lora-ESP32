@@ -24,7 +24,7 @@ HardwareSerial LoRa(2);
 
 // ================= PARAMETERS =================
 const int MAX_AP_TO_SEND = 10;
-const long sendInterval = 50000; // 10s
+const long sendInterval = 10000; // 10s
 
 long lastSendTime = 0;
 
@@ -51,7 +51,16 @@ bool isLikelyHotspot(String ssid, uint8_t* bssid) {
   return false;
 }
 
-// ================= HTTP SEND =================
+// =================  SEND =================
+
+void sendCmd(String cmd) {
+  Serial.print("CMD> ");
+  Serial.println(cmd);
+  LoRa.println(cmd);
+}
+
+
+
 void sendJson(String url, String json) {
   HTTPClient http;
   http.begin(url);
@@ -134,6 +143,40 @@ void joinTTN() {
 }
 
 
+int packScanData(uint8_t* buffer, int maxLen) {
+  int index = 0;
+
+  // Device ID as a single byte (map "esp32-001" -> 1)
+  buffer[index++] = 1;
+
+  int n = WiFi.scanNetworks(false, true);
+  int validCount = 0;
+  buffer[index++] = 0; // placeholder for scan count
+
+  for (int i = 0; i < n && validCount < 7; i++) {
+    String ssid = WiFi.SSID(i);
+    uint8_t* bssid = WiFi.BSSID(i);
+    if (isLikelyHotspot(ssid, bssid)) continue;
+
+    // MAC 6 bytes
+    for (int m = 0; m < 6; m++) buffer[index++] = bssid[m];
+
+    // RSSI 1 byte (signed)
+    int8_t rssi = WiFi.RSSI(i);
+    buffer[index++] = rssi;
+
+    validCount++;
+  }
+
+  // Set scan count
+  buffer[1] = validCount;
+
+  return index; // total length of payload
+}
+
+
+
+
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
@@ -166,7 +209,7 @@ void setup() {
 
 // ================= LOOP =================
 void loop() {
-  // -------- 1 Check LoRa for coordinates --------
+  // -------- 1. Check LoRa for messages and join status --------
   while (LoRa.available()) {
     String line = LoRa.readStringUntil('\n');
     line.trim();
@@ -175,17 +218,17 @@ void loop() {
     Serial.print("LoRa received: ");
     Serial.println(line);
 
-    if (line.indexOf("Network joined") >= 0 || line.indexOf("+JOIN: Success") >= 0) {
+    if (line.indexOf("+JOIN: Success") >= 0 ||
+        line.indexOf("Network joined") >= 0) {
       isJoined = true;
       Serial.println("TTN Network joined successfully!");
     }
- 
   }
 
-  // -------- 2 Wi-Fi must be connected --------
+  // -------- 2. Wi-Fi must be connected --------
   if (WiFi.status() != WL_CONNECTED) return;
 
-  // -------- 3 Send Wi-Fi scan every interval --------
+  // -------- 3. Send Wi-Fi scan every interval --------
   long now = millis();
   if (now - lastSendTime < sendInterval) return;
   lastSendTime = now;
@@ -197,52 +240,74 @@ void loop() {
     return;
   }
 
-  String scanJson = "[";
-  int validCount = 0;
-  for (int i = 0; i < n && validCount < MAX_AP_TO_SEND; i++) {
-    String ssid = WiFi.SSID(i);
-    uint8_t* bssid = WiFi.BSSID(i);
-    if (isLikelyHotspot(ssid, bssid)) continue;
+  // -------- 4. Dual-mode send --------
+  if (isJoined) {
+    // ===== LoRaWAN send =====
+    uint8_t payload[51];
+    int len = packScanData(payload, 51);
 
-    if (validCount > 0) scanJson += ",";
+    Serial.print("--- Sending payload over TTN, length: ");
+    Serial.println(len);
 
-    char mac[18];
-    sprintf(mac, "%02X:%02X:%02X:%02X:%02X:%02X",
-            bssid[0], bssid[1], bssid[2],
-            bssid[3], bssid[4], bssid[5]);
+    // Optional: print payload for debug
+    Serial.print("Payload bytes: ");
+    for (int i = 0; i < len; i++) {
+      Serial.print(payload[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
 
-    scanJson += "{";
-    scanJson += "\"mac\":\"";
-    scanJson += mac;
-    scanJson += "\",\"rssi\":";
-    scanJson += WiFi.RSSI(i);
-    scanJson += "}";
+    LoRa.write(payload, len);
+    sendCmd("AT+SEND=2," + String(len));
+  } else {
+    // ===== Fallback HTTP send =====
+    String scanJson = "[";
+    int validCount = 0;
 
-    Serial.print(validCount);
-    Serial.print(": ");
-    Serial.print(ssid);
-    Serial.print(" (");
-    Serial.print(WiFi.RSSI(i));
-    Serial.print(" dBm) MAC: ");
-    Serial.println(mac);
+    for (int i = 0; i < n && validCount < MAX_AP_TO_SEND; i++) {
+      String ssid = WiFi.SSID(i);
+      uint8_t* bssid = WiFi.BSSID(i);
+      if (isLikelyHotspot(ssid, bssid)) continue;
 
-    validCount++;
+      if (validCount > 0) scanJson += ",";
+
+      char mac[18];
+      sprintf(mac, "%02X:%02X:%02X:%02X:%02X:%02X",
+              bssid[0], bssid[1], bssid[2],
+              bssid[3], bssid[4], bssid[5]);
+
+      scanJson += "{\"mac\":\"";
+      scanJson += mac;
+      scanJson += "\",\"rssi\":";
+      scanJson += WiFi.RSSI(i);
+      scanJson += "}";
+
+      Serial.print(validCount);
+      Serial.print(": ");
+      Serial.print(ssid);
+      Serial.print(" (");
+      Serial.print(WiFi.RSSI(i));
+      Serial.print(" dBm) MAC: ");
+      Serial.println(mac);
+
+      validCount++;
+    }
+
+    scanJson += "]";
+
+    if (validCount == 0) {
+      Serial.println("No valid fixed APs to send");
+      return;
+    }
+
+    // Build JSON payload
+    String locatePayload = "{";
+    locatePayload += "\"device_id\":\"" DEVICE_ID "\",";
+    locatePayload += "\"scan\":" + scanJson;
+    locatePayload += "}";
+
+    Serial.println("--- Sending fallback HTTP payload ---");
+    Serial.println(locatePayload);
+    sendJson(LOCATE_URL, locatePayload);
   }
-  scanJson += "]";
-
-  if (validCount == 0) {
-    Serial.println("No valid fixed APs");
-    return;
-  }
-
-  // -------- 4 Send /scan/locate payload --------
-  String locatePayload = "{";
-  locatePayload += "\"device_id\":\"" DEVICE_ID "\",";
-  locatePayload += "\"scan\":" + scanJson;
-  locatePayload += "}";
-  Serial.println("--- Sending to /scan/locate ---");
-  Serial.println(locatePayload);
-  sendJson(LOCATE_URL, locatePayload);
-
-
 }
