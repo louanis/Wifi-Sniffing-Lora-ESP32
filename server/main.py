@@ -54,6 +54,8 @@ class CalibrationRequest(BaseModel):
 # -----------------------------
 pending_calibrations: Dict[str, Tuple[float, float]] = {}
 last_estimated_positions: Dict[str, Tuple[float, float]] = {}
+position_history: Dict[str, list] = {}
+
 
 # -----------------------------
 # DB session
@@ -187,17 +189,17 @@ async def locate(request: Request, session: Session = Depends(get_session)):
 
     lat = weighted_lat / total_weight
     lon = weighted_lon / total_weight
-    
+
     # Save last estimated position
     last_estimated_positions[scan.device_id] = (lat, lon)
-    
+
     # ---- ADD THIS PART ----
     position_history.setdefault(scan.device_id, []).append((lat, lon))
-    
+
     # keep last ~4 minutes of data (50 points @ 5s)
     position_history[scan.device_id] = position_history[scan.device_id][-50:]
     # -----------------------
-    
+
 
     return {
         "status": "ok",
