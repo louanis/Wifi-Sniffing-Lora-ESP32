@@ -7,7 +7,7 @@
 #define WIFI_PASSWORD "quoicouEchecScolaireBeh"
 
 // ================= API CONFIG =================
-#define DEVICE_ID "esp32-001"
+#define DEVICE_ID "esp32-001" //Pour l'envoi en HTTP surtout
 #define LOCATE_URL "http://vps-98cd652a.vps.ovh.net:8067/scan/locate"
 #define CALIBRATE_URL "http://vps-98cd652a.vps.ovh.net:8067/scan/calibrate"
 
@@ -24,7 +24,7 @@ HardwareSerial LoRa(2);
 
 // ================= PARAMETERS =================
 const int MAX_AP_TO_SEND = 10;
-const long sendInterval = 5000; // 10s
+const long sendInterval = 5000; // 5s, choisi pour laisser le temps au module lora de communiqué l'emprunte mesurée
 
 long lastSendTime = 0;
 
@@ -136,19 +136,19 @@ void joinTTN() {
 
   Serial.println("Sending join request...");
   sendCmd("AT+JOIN");
-  pollLoRa(3000); // join can take time
+  pollLoRa(3000); // delai pour eviter d'envoyer qq chose pendant l'envoi
 }
 
 
 int packScanData(uint8_t* buffer, int maxLen) {
   int index = 0;
 
-  // Device ID as a single byte (map "esp32-001" -> 1)
+  // Device ID en 1 octet pour pas prendre trop de place (map "esp32-001" -> 1)
   buffer[index++] = 1;
 
   int n = WiFi.scanNetworks(false, true);
   int validCount = 0;
-  buffer[index++] = 0; // placeholder for scan count
+  buffer[index++] = 0; // placeholder 
 
   for (int i = 0; i < n && validCount < 7; i++) {
     String ssid = WiFi.SSID(i);
@@ -240,7 +240,7 @@ void loop() {
 
   // -------- 4. Dual-mode send --------
   // ================= LORA SEND PART =================
-if(isJoined) {
+  if(isJoined) {
 
     Serial.println("\n--- WiFi Scan for LoRa ---");
     int n = WiFi.scanNetworks(false, true);
@@ -249,18 +249,18 @@ if(isJoined) {
     uint8_t payload[64];
     int idx = 0;
 
-    // --- HEADER + timestamp ---
+    // --- HEADER + timestamp (toujours utilisable par la suite) ---
     payload[idx++] = 0x55; // header marker
     uint16_t ts = millis() / 1000;
     payload[idx++] = (ts >> 8) & 0xFF;
     payload[idx++] = ts & 0xFF;
 
-    // Reserve byte for AP count
+    // octet pour le nombre de reseaux (pour decoder apres)
     int countIndex = idx++;
     int validAPCount = 0;
 
-    // --- Take only up to 3 valid APs ---
-    for(int i = 0; i < n && validAPCount < 3; i++) {
+    // --- envoie max 6 couple mac:rssi (pour pas depasser la limite d'octet de la trame lora, testé empiriquement) ---
+    for(int i = 0; i < n && validAPCount < 6; i++) {
         String ssid = WiFi.SSID(i);
         uint8_t* bssid = WiFi.BSSID(i);
         if(isLikelyHotspot(ssid, bssid)) continue;
@@ -301,7 +301,7 @@ if(isJoined) {
         Serial.println("LoRa payload sent with " + String(validAPCount) + " APs");
     }
     
-} else {
+  } else {
     // ===== Fallback HTTP send =====
     String scanJson = "[";
     int validCount = 0;
