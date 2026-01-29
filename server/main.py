@@ -242,17 +242,11 @@ def show_map(device_id: str, session: Session = Depends(get_session)):
     # Get HTML
     html = m._repr_html_()
 
-    # Inject auto-refresh JS (every 5 seconds)
-    auto_refresh = """
-    <script>
-    setTimeout(function(){
-        window.location.reload();
-    }, 5000);
-    </script>
-    """
+    # Inject a reliable meta refresh tag in the <head>
+    refresh_tag = '<meta http-equiv="refresh" content="5">'  # 5 seconds
+    html_str = html_str.replace("<head>", f"<head>{refresh_tag}")
     
-    return html.replace("</body>", auto_refresh + "</body>")
-
+    return HTMLResponse(content=html_str)
 
 # -----------------------------
 # Root
