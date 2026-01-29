@@ -54,8 +54,6 @@ class CalibrationRequest(BaseModel):
 # -----------------------------
 pending_calibrations: Dict[str, Tuple[float, float]] = {}
 last_estimated_positions: Dict[str, Tuple[float, float]] = {}
-position_history: Dict[str, list] = {}
-
 
 # -----------------------------
 # DB session
@@ -190,16 +188,7 @@ async def locate(request: Request, session: Session = Depends(get_session)):
     lat = weighted_lat / total_weight
     lon = weighted_lon / total_weight
 
-    # Save last estimated position
     last_estimated_positions[scan.device_id] = (lat, lon)
-
-    # ---- ADD THIS PART ----
-    position_history.setdefault(scan.device_id, []).append((lat, lon))
-
-    # keep last ~4 minutes of data (50 points @ 5s)
-    position_history[scan.device_id] = position_history[scan.device_id][-50:]
-    # -----------------------
-
 
     return {
         "status": "ok",
@@ -212,77 +201,43 @@ async def locate(request: Request, session: Session = Depends(get_session)):
 @app.get("/map/{device_id}", response_class=HTMLResponse)
 def show_map(device_id: str, session: Session = Depends(get_session)):
 
-    history = position_history.get(device_id)
+    # 1. Exact device match
+    if device_id in last_estimated_positions:
+        lat, lon = last_estimated_positions[device_id]
+        label = f"Estimated position ({device_id})"
+        color = "red"
 
+    # 2. Fallback: last estimated position from ANY device
+    elif last_estimated_positions:
+        last_device, (lat, lon) = next(reversed(last_estimated_positions.items()))
+        label = f"Estimated position ({last_device})"
+        color = "orange"
 
-    # Determine device position 
-    if device_id in last_estimated_positions: 
-        lat, lon = last_estimated_positions[device_id] 
-        label = f"Estimated position ({device_id})" 
-        color = "red" 
-    elif last_estimated_positions: 
-        last_device, (lat, lon) = next(reversed(last_estimated_positions.items())) 
-        label = f"Estimated position ({last_device})" 
-        color = "orange" 
-    else: 
-        fp = session.exec( select(Fingerprint).order_by(Fingerprint.id.desc()) ).first() 
-        if fp: 
-            lat, lon = fp.lat, fp.lon 
-            label = "Last calibration point" 
-            color = "blue" 
-        else: 
-            lat, lon = 48.8566, 2.3522 
-            label = "Default" 
-            color = "gray"
-
-    # Fallback if nothing yet
-    if not history:
+    # 3. Fallback: last calibration point
+    else:
         fp = session.exec(
             select(Fingerprint).order_by(Fingerprint.id.desc())
         ).first()
 
         if fp:
             lat, lon = fp.lat, fp.lon
+            label = "Last calibration point"
+            color = "blue"
         else:
-            lat, lon = 48.8566, 2.3522
+            lat, lon = 48.8566
+            lon = 2.3522
+            label = "Default"
+            color = "gray"
 
-        m = folium.Map(location=[lat, lon], zoom_start=17)
-        return HTMLResponse(content=m.get_root().render())
-
-    # Center on latest point
-    lat, lon = history[-1]
     m = folium.Map(location=[lat, lon], zoom_start=17)
 
-    total = len(history)
+    folium.Marker(
+        [lat, lon],
+        popup=f"{label}<br>Lat: {lat}<br>Lon: {lon}",
+        icon=folium.Icon(color=color)
+    ).add_to(m)
 
-    # Draw fading trail
-    for i in range(1, total):
-        lat1, lon1 = history[i - 1]
-        lat2, lon2 = history[i]
-
-        # 0.0 (oldest) → 1.0 (newest)
-        ratio = i / total
-
-        intensity = int(255 * ratio)
-        intensity = max(60, intensity)  # avoid too dark
-
-        color = f"#{intensity:02x}0000"  # dark → bright red
-
-        folium.PolyLine(
-            locations=[(lat1, lon1), (lat2, lon2)],
-            color=color,
-            weight=4,
-            opacity=0.9
-        ).add_to(m)
-
-    html_str = m.get_root().render()
-
-    # Auto-refresh every 5 seconds (match uplink rate)
-    refresh_tag = '<meta http-equiv="refresh" content="5">'
-    html_str = html_str.replace("<head>", f"<head>{refresh_tag}")
-
-    return HTMLResponse(content=html_str)
-
+    return m._repr_html_()
 
 # -----------------------------
 # Root
