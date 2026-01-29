@@ -136,7 +136,7 @@ void joinTTN() {
 
   Serial.println("Sending join request...");
   sendCmd("AT+JOIN");
-  pollLoRa(3000); // delai pour eviter d'envoyer qq chose pendant l'envoi
+  pollLoRa(5000); // delai pour eviter d'envoyer qq chose pendant l'envoi
 }
 
 
@@ -198,7 +198,7 @@ void setup() {
     Serial.println("WiFi FAILED TO CONNECT");
   }
 
-  // LoRa setup (optional)
+  // LoRa setup
   LoRa.begin(LORA_BAUD, SERIAL_8N1, LORA_RX, LORA_TX);
   Serial.println("LoRa initialized");
 
