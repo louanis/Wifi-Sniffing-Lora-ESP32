@@ -214,6 +214,27 @@ def show_map(device_id: str, session: Session = Depends(get_session)):
 
     history = position_history.get(device_id)
 
+
+    # Determine device position 
+    if device_id in last_estimated_positions: 
+        lat, lon = last_estimated_positions[device_id] 
+        label = f"Estimated position ({device_id})" 
+        color = "red" 
+    elif last_estimated_positions: 
+        last_device, (lat, lon) = next(reversed(last_estimated_positions.items())) 
+        label = f"Estimated position ({last_device})" 
+        color = "orange" 
+    else: 
+        fp = session.exec( select(Fingerprint).order_by(Fingerprint.id.desc()) ).first() 
+        if fp: 
+            lat, lon = fp.lat, fp.lon 
+            label = "Last calibration point" 
+            color = "blue" 
+        else: 
+            lat, lon = 48.8566, 2.3522 
+            label = "Default" 
+            color = "gray"
+
     # Fallback if nothing yet
     if not history:
         fp = session.exec(
