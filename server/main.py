@@ -242,7 +242,7 @@ def show_map(device_id: str, session: Session = Depends(get_session)):
     # Get HTML
     html = m._repr_html_()
 
-    # Inject auto-refresh JS (every 3 seconds)
+    # Inject auto-refresh JS (every 5 seconds)
     auto_refresh = """
     <script>
     setTimeout(function(){
