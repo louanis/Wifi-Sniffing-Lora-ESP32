@@ -239,8 +239,8 @@ def show_map(device_id: str, session: Session = Depends(get_session)):
         icon=folium.Icon(color=color)
     ).add_to(m)
 
-    # Get HTML
-    html = m._repr_html_()
+    # Instead of _repr_html_(), save HTML to string
+    html_str = m.get_root().render()
 
     # Inject a reliable meta refresh tag in the <head>
     refresh_tag = '<meta http-equiv="refresh" content="5">'  # 5 seconds
